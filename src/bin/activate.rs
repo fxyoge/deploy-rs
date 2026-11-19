@@ -9,6 +9,7 @@ use signal_hook::{consts::signal::SIGHUP, iterator::Signals};
 use clap::Parser;
 
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -16,6 +17,7 @@ use tokio::time::timeout;
 use std::time::Duration;
 
 use std::env;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use notify::{recommended_watcher, RecommendedWatcher, RecursiveMode, Watcher};
@@ -45,6 +47,7 @@ struct Opts {
 enum SubCommand {
     Activate(ActivateOpts),
     Wait(WaitOpts),
+    Confirm(WaitOpts),
     Revoke(RevokeOpts),
 }
 
@@ -249,6 +252,8 @@ pub enum ActivationConfirmationError {
     CreateConfirmDir(std::io::Error),
     #[error("Failed to create activation confirmation file: {0}")]
     CreateConfirmFile(std::io::Error),
+    #[error("Failed to acknowledge activation confirmation: {0}")]
+    Acknowledge(std::io::Error),
     #[error("Could not watch for activation sentinel: {0}")]
     Watcher(#[from] notify::Error),
     #[error("Error waiting for confirmation event: {0}")]
@@ -381,14 +386,32 @@ pub async fn activation_confirmation(
 
     debug!("Creating canary file");
 
-    fs::File::create(&lock_path)
+    let mut canary = fs::File::create(&lock_path)
         .await
         .map_err(ActivationConfirmationError::CreateConfirmFile)?;
 
     let result = danger_zone(done, confirm_timeout).await;
     // Stop observing removals before cleaning up an unconfirmed canary.
     drop(watcher);
-    if result.is_err() {
+    if result.is_ok()
+        && canary
+            .metadata()
+            .await
+            .map_err(ActivationConfirmationError::Acknowledge)?
+            .nlink()
+            > 0
+    {
+        // A linked canary remains readable after SSH reconnects. Legacy
+        // clients unlink it entirely and do not need this acknowledgement.
+        canary
+            .write_all(b"success")
+            .await
+            .map_err(ActivationConfirmationError::Acknowledge)?;
+        canary
+            .flush()
+            .await
+            .map_err(ActivationConfirmationError::Acknowledge)?;
+    } else if result.is_err() {
         if let Err(err) = fs::remove_file(&lock_path).await {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!("Could not remove unconfirmed canary: {}", err);
@@ -573,6 +596,26 @@ mod tests {
             .await
             .expect("remove empty directory");
     }
+
+    #[tokio::test]
+    async fn confirmation_can_be_retried_after_ssh_disconnects() {
+        let id = TEMP_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let path = test_directory("confirmation-reconnect", id).await;
+        let closure = test_closure(id);
+        let activation = tokio::spawn(activation_confirmation(path.clone(), 5, closure.clone()));
+        wait(path.clone(), closure.clone(), Some(5)).await.unwrap();
+        for _ in 0..2 {
+            confirm(WaitOpts {
+                temp_path: path.clone(),
+                closure: closure.clone(),
+                activation_timeout: Some(5),
+            })
+            .await
+            .unwrap();
+        }
+        activation.await.unwrap().unwrap();
+        fs::remove_dir_all(path).await.unwrap();
+    }
 }
 
 #[derive(Error, Debug)]
@@ -651,6 +694,42 @@ pub async fn wait(
 
     info!("Found canary file, done waiting!");
 
+    Ok(())
+}
+
+async fn confirm(options: WaitOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let lock_path = deploy::make_lock_path(&options.temp_path, &options.closure);
+    let confirmed = options.temp_path.join("confirmed");
+    match fs::hard_link(&lock_path, &confirmed).await {
+        Ok(()) => (),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+            ) => {}
+        Err(err) => return Err(err.into()),
+    }
+    match fs::remove_file(lock_path).await {
+        Ok(()) => (),
+        // Confirmation may have reached the worker before SSH disconnected.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+        Err(err) => return Err(err.into()),
+    }
+    timeout(
+        Duration::from_secs(options.activation_timeout.unwrap_or(30).into()),
+        async {
+            loop {
+                match fs::read(&confirmed).await {
+                    Ok(result) if result == b"success" => return Ok(()),
+                    Ok(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        },
+    )
+    .await??;
     Ok(())
 }
 
@@ -880,7 +959,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         opts.log_dir.as_deref(),
         &match opts.subcmd {
             SubCommand::Activate(_) => deploy::LoggerType::Activate,
-            SubCommand::Wait(_) => deploy::LoggerType::Wait,
+            SubCommand::Wait(_) | SubCommand::Confirm(_) => deploy::LoggerType::Wait,
             SubCommand::Revoke(_) => deploy::LoggerType::Revoke,
         },
     )?;
@@ -911,6 +990,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),
+
+        SubCommand::Confirm(options) => confirm(options).await,
 
         SubCommand::Revoke(revoke_opts) => revoke(get_profile_path(
             revoke_opts.profile_path,

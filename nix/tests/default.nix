@@ -263,7 +263,7 @@ in {
     deploySteps = let
       ignoreConfirmation = pkgs.writeShellScript "ssh-ignore-confirmation" ''
         case "''${!#}" in
-          'rm '*) exit 0 ;;
+          *' confirm '*) exit 0 ;;
         esac
         exec ${pkgs.openssh}/bin/ssh "$@"
       '';

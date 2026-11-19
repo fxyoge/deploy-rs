@@ -5,7 +5,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use log::{debug, info, trace, warn};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -293,6 +294,92 @@ pub enum ConfirmProfileError {
     SSHConfirm(#[from] command::CommandError<SSHConfirmError>),
 }
 
+async fn reconnect_ssh(
+    command: &mut Command,
+    deploy_data: &super::DeployData,
+    deploy_defs: &super::DeployDefs,
+    seconds: u16,
+    demarcate_output: bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    command.kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(seconds.into()), async {
+        loop {
+            let mut child = command.spawn()?;
+            if deploy_data
+                .merged_settings
+                .interactive_sudo
+                .unwrap_or(false)
+            {
+                handle_sudo_stdin(&mut child, deploy_defs).await?;
+            }
+            let status = read_remote_process_child(child, demarcate_output).await?;
+            if status.code() != Some(255) {
+                return Ok(status);
+            }
+            warn!("SSH disconnected; reconnecting to the activation worker");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reconnecting to activation",
+        )
+    })?
+}
+
+async fn prepare_remote_directory(
+    deploy_data: &super::DeployData,
+    deploy_defs: &super::DeployDefs,
+    ssh_addr: &str,
+    base: &Path,
+) -> std::io::Result<PathBuf> {
+    let template = base.join("deploy-rs.XXXXXXXXXX");
+    let mut remote = format!(
+        "mktemp -d -- '{}'",
+        template.display().to_string().replace('\'', "'\\''")
+    );
+    if let Some(sudo) = &deploy_defs.sudo {
+        remote = format!("{} {}", sudo, remote);
+    }
+    let mut child = Command::new("ssh")
+        .arg(ssh_addr)
+        .args(&deploy_data.merged_settings.ssh_opts)
+        .arg(remote)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    if deploy_data
+        .merged_settings
+        .interactive_sudo
+        .unwrap_or(false)
+    {
+        handle_sudo_stdin(&mut child, deploy_defs).await?;
+    }
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "mktemp over SSH failed: {}",
+            output.status
+        )));
+    }
+    let path = String::from_utf8(output.stdout)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let path = PathBuf::from(path.trim());
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("deploy-rs."));
+    if path.parent() != Some(base) || !valid_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mktemp returned an unexpected activation directory",
+        ));
+    }
+    Ok(path)
+}
+
 pub async fn confirm_profile(
     deploy_data: &super::DeployData,
     deploy_defs: &super::DeployDefs,
@@ -309,9 +396,14 @@ pub async fn confirm_profile(
         ssh_confirm_command.arg(ssh_opt);
     }
 
-    let lock_path = super::make_lock_path(temp_path, closure);
-
-    let mut confirm_command = format!("rm {}", lock_path.display());
+    let confirm_timeout = deploy_data.merged_settings.confirm_timeout.unwrap_or(30);
+    let mut confirm_command = format!(
+        "{}/activate-rs confirm '{}' --temp-path '{}' --activation-timeout {}",
+        closure,
+        closure,
+        temp_path.display(),
+        confirm_timeout
+    );
     if let Some(sudo_cmd) = &deploy_defs.sudo {
         confirm_command = format!("{} {}", sudo_cmd, confirm_command);
     }
@@ -321,26 +413,15 @@ pub async fn confirm_profile(
         confirm_command
     );
 
-    let mut ssh_confirm_child = ssh_confirm_command
-        .arg(confirm_command)
-        .spawn()
-        .map_err(|e| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(e)))?;
-
-    if deploy_data
-        .merged_settings
-        .interactive_sudo
-        .unwrap_or(false)
-    {
-        trace!("[confirm] Piping in sudo password");
-        handle_sudo_stdin(&mut ssh_confirm_child, deploy_defs)
-            .await
-            .map_err(|err| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(err)))?;
-    }
-
-    let ssh_confirm_exit_status = ssh_confirm_child
-        .wait()
-        .await
-        .map_err(|err| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(err)))?;
+    let ssh_confirm_exit_status = reconnect_ssh(
+        ssh_confirm_command.arg(&confirm_command),
+        deploy_data,
+        deploy_defs,
+        confirm_timeout,
+        false,
+    )
+    .await
+    .map_err(|err| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(err)))?;
 
     match ssh_confirm_exit_status.code() {
         Some(0) => (),
@@ -373,6 +454,13 @@ impl command::HasCommandError for SSHActivateError {
 
 #[derive(Error, Debug)]
 pub enum SSHWaitError {}
+
+fn is_ssh_disconnect(result: &Result<(), DeployProfileError>) -> bool {
+    matches!(result,
+        Err(DeployProfileError::SSHActivate(command::CommandError::ExitStatus(status, _)))
+            if status.code() == Some(255)
+    )
+}
 
 impl command::HasCommandError for SSHWaitError {
     fn title() -> String {
@@ -489,6 +577,26 @@ pub async fn deploy_profile(
 
     let auto_rollback = deploy_data.merged_settings.auto_rollback.unwrap_or(true);
 
+    let hostname = match deploy_data.cmd_overrides.hostname {
+        Some(ref x) => x,
+        None => &deploy_data.node.node_settings.hostname,
+    };
+    let ssh_addr = format!("{}@{}", deploy_defs.ssh_user, hostname);
+    // A fresh, remotely created private directory lets a reconnect distinguish
+    // this worker's outcome from earlier attempts at the same closure.
+    let attempt_directory = if magic_rollback && !dry_activate && !boot {
+        Some(
+            prepare_remote_directory(deploy_data, deploy_defs, &ssh_addr, temp_path)
+                .await
+                .map_err(|err| {
+                    DeployProfileError::SSHActivate(command::CommandError::RunError(err))
+                })?,
+        )
+    } else {
+        None
+    };
+    let temp_path = attempt_directory.as_deref().unwrap_or(temp_path);
+
     let self_activate_command = build_activate_command(&ActivateCommandData {
         sudo: &deploy_defs.sudo,
         profile_info: &deploy_data.get_profile_info()?,
@@ -505,13 +613,6 @@ pub async fn deploy_profile(
     });
 
     debug!("Constructed activation command: {}", self_activate_command);
-
-    let hostname = match deploy_data.cmd_overrides.hostname {
-        Some(ref x) => x,
-        None => &deploy_data.node.node_settings.hostname,
-    };
-
-    let ssh_addr = format!("{}@{}", deploy_defs.ssh_user, hostname);
 
     let mut ssh_activate_command = Command::new("ssh");
     ssh_activate_command
@@ -658,53 +759,48 @@ pub async fn deploy_profile(
             }
         });
 
-        let mut ssh_wait_child = ssh_wait_command
-            .arg(self_wait_command)
-            .spawn()
-            .map_err(|err| DeployProfileError::SSHWait(command::CommandError::RunError(err)))?;
+        let waiting = reconnect_ssh(
+            ssh_wait_command.arg(&self_wait_command),
+            deploy_data,
+            deploy_defs,
+            activation_timeout.unwrap_or(240),
+            demarcate_output,
+        );
+        tokio::pin!(waiting);
 
-        if deploy_data
-            .merged_settings
-            .interactive_sudo
-            .unwrap_or(false)
-        {
-            trace!("[wait] Piping in sudo password");
-            handle_sudo_stdin(&mut ssh_wait_child, deploy_defs)
-                .await
-                .map_err(|err| {
-                    DeployProfileError::SSHActivate(command::CommandError::OtherError(
-                        SSHActivateError::PipeError(err),
-                    ))
-                })?;
-        }
-
-        tokio::select! {
-            x = read_remote_process_child(ssh_wait_child, demarcate_output) => {
-                debug!("Wait command ended");
-                let status = x.map_err(|err| DeployProfileError::SSHWait(command::CommandError::RunError(err)))?;
-                match status.code() {
-                    Some(0) => (),
-                    _exit_code => return Err(DeployProfileError::SSHWait(
-                        command::CommandError::ExitStatus(status, format!("{:?}", ssh_wait_command))
-                    )),
-                };
-            },
+        let mut activation_finished = false;
+        let status = tokio::select! {
+            x = &mut waiting => x,
             x = &mut activation => {
-                x.map_err(|err| DeployProfileError::SSHActivate(command::CommandError::RunError(err.into())))??;
-                return Err(DeployProfileError::SSHActivate(command::CommandError::RunError(
-                    std::io::Error::other("activation ended before confirmation was requested")
-                )));
+                activation_finished = true;
+                let result = x.map_err(|err| DeployProfileError::SSHActivate(command::CommandError::RunError(err.into())))?;
+                if !is_ssh_disconnect(&result) {
+                    result?;
+                    return Err(DeployProfileError::SSHActivate(command::CommandError::RunError(
+                        std::io::Error::other("activation ended before confirmation was requested")
+                    )));
+                }
+                warn!("Activation SSH disconnected; waiting for the remote worker");
+                waiting.await
             },
+        }.map_err(|err| DeployProfileError::SSHWait(command::CommandError::RunError(err)))?;
+        if !status.success() {
+            return Err(DeployProfileError::SSHWait(
+                command::CommandError::ExitStatus(status, self_wait_command.clone()),
+            ));
         }
 
         info!("Success activating, attempting to confirm activation");
 
-        let confirmation =
-            confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr, closure).await;
-        activation.await.map_err(|x| {
-            DeployProfileError::SSHActivate(command::CommandError::RunError(x.into()))
-        })??;
-        confirmation?;
+        confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr, closure).await?;
+        if !activation_finished {
+            let result = activation.await.map_err(|x| {
+                DeployProfileError::SSHActivate(command::CommandError::RunError(x.into()))
+            })?;
+            if !is_ssh_disconnect(&result) {
+                result?;
+            }
+        }
         info!("Deployment confirmed.");
     }
 
