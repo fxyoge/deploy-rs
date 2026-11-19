@@ -274,7 +274,7 @@ pub enum DangerZoneError {
     NoConfirmation,
     #[error("inotify encountered an error: {0}")]
     Watch(notify::Error),
-    #[error("Activation cancelled by deployment client")]
+    #[error("Activation failed or was cancelled")]
     Cancelled,
 }
 
@@ -492,6 +492,12 @@ mod tests {
             other => panic!("expected Cancelled, got {:?}", other),
         }
 
+        // A waiter whose SSH reply was lost must not consume the result.
+        assert!(matches!(
+            wait(temp_path.clone(), closure.clone(), Some(1)).await,
+            Err(WaitError::Waiting(DangerZoneError::Cancelled))
+        ));
+
         let _ = fs::remove_dir_all(&temp_path).await;
     }
 
@@ -514,9 +520,13 @@ mod tests {
         }
 
         assert!(
-            !deploy::make_cancel_path(&temp_path, &closure).exists(),
-            "wait should not leave the cancel file behind"
+            deploy::make_cancel_path(&temp_path, &closure).exists(),
+            "failure must remain readable after SSH reconnects"
         );
+        assert!(matches!(
+            wait(temp_path.clone(), closure.clone(), Some(1)).await,
+            Err(WaitError::Waiting(DangerZoneError::Cancelled))
+        ));
 
         let _ = fs::remove_dir_all(&temp_path).await;
     }
@@ -540,6 +550,34 @@ mod tests {
             .expect("observe canary creation");
 
         let _ = fs::remove_dir_all(&temp_path).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiters_do_not_poison_next_activation() {
+        let id = TEMP_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let path = test_directory("cancel-retry", id).await;
+        let closure = test_closure(id);
+        create_activation_cancel(&path, &closure).await;
+        for _ in 0..2 {
+            assert!(matches!(
+                wait(path.clone(), closure.clone(), Some(1)).await,
+                Err(WaitError::Waiting(DangerZoneError::Cancelled))
+            ));
+        }
+
+        // activate() owns reset; a later activation of the same closure works.
+        remove_activation_cancel(&path, &closure).await;
+        let activation = tokio::spawn(activation_confirmation(path.clone(), 5, closure.clone()));
+        wait(path.clone(), closure.clone(), Some(5)).await.unwrap();
+        confirm(WaitOpts {
+            temp_path: path.clone(),
+            closure,
+            activation_timeout: Some(5),
+        })
+        .await
+        .unwrap();
+        activation.await.unwrap().unwrap();
+        fs::remove_dir_all(path).await.unwrap();
     }
 
     #[tokio::test]
@@ -680,17 +718,12 @@ pub async fn wait(
     // it leaves behind has to be picked up here rather than waited for.
     if fs::metadata(&cancel_path).await.is_ok() {
         watcher.unwatch(&temp_path)?;
-        remove_activation_cancel(&temp_path, &closure).await;
         return Err(DangerZoneError::Cancelled.into());
     }
 
-    let waited = danger_zone(done, activation_timeout.unwrap_or(240)).await;
-
-    if matches!(waited, Err(DangerZoneError::Cancelled)) {
-        remove_activation_cancel(&temp_path, &closure).await;
-    }
-
-    waited?;
+    // Waiters are read-only: their SSH connection may disappear before the
+    // client receives the failure. Only a new activation clears this marker.
+    danger_zone(done, activation_timeout.unwrap_or(240)).await?;
 
     info!("Found canary file, done waiting!");
 
