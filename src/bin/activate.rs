@@ -377,7 +377,7 @@ pub async fn activation_confirmation(
 
     debug!("Creating notify watcher");
 
-    let (_watcher, done) = confirmation_watcher(&temp_path, &lock_path)?;
+    let (watcher, done) = confirmation_watcher(&temp_path, &lock_path)?;
 
     debug!("Creating canary file");
 
@@ -385,9 +385,17 @@ pub async fn activation_confirmation(
         .await
         .map_err(ActivationConfirmationError::CreateConfirmFile)?;
 
-    danger_zone(done, confirm_timeout)
-        .await
-        .map_err(ActivationConfirmationError::WaitingError)
+    let result = danger_zone(done, confirm_timeout).await;
+    // Stop observing removals before cleaning up an unconfirmed canary.
+    drop(watcher);
+    if result.is_err() {
+        if let Err(err) = fs::remove_file(&lock_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!("Could not remove unconfirmed canary: {}", err);
+            }
+        }
+    }
+    result.map_err(ActivationConfirmationError::WaitingError)
 }
 
 #[cfg(test)]
@@ -531,6 +539,39 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_path).await;
+    }
+
+    #[tokio::test]
+    async fn confirmation_timeout_does_not_poison_retry() {
+        let id = TEMP_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = test_directory("confirmation-timeout", id).await;
+        let closure = test_closure(id);
+        assert!(matches!(
+            activation_confirmation(temp_path.clone(), 0, closure.clone()).await,
+            Err(ActivationConfirmationError::WaitingError(
+                DangerZoneError::TimesUp
+            ))
+        ));
+        assert!(!deploy::make_lock_path(&temp_path, &closure).exists());
+
+        let confirmation = tokio::spawn(activation_confirmation(
+            temp_path.clone(),
+            5,
+            closure.clone(),
+        ));
+        wait(temp_path.clone(), closure.clone(), Some(5))
+            .await
+            .expect("wait for the new activation, not the timed-out canary");
+        fs::remove_file(deploy::make_lock_path(&temp_path, &closure))
+            .await
+            .expect("confirm retry");
+        confirmation
+            .await
+            .expect("join activation")
+            .expect("retry succeeds");
+        fs::remove_dir(&temp_path)
+            .await
+            .expect("remove empty directory");
     }
 }
 

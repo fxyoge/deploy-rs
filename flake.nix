@@ -84,7 +84,7 @@
                             name = base.name + "-activate-rs";
                             text = ''
                             #!${final.runtimeShell}
-                            exec ${final.deploy-rs.deploy-rs}/bin/activate "$@"
+                            exec ${customSelf.activateCommand or "${final.deploy-rs.deploy-rs}/bin/activate"} "$@"
                           '';
                           executable = true;
                           destination = "/activate-rs";
@@ -95,6 +95,16 @@
 
             nixos = base:
               (custom // {
+                # The worker must survive both SSH disconnects and SSH server
+                # restarts. --pipe/--scope would tie its I/O or lifetime to SSH.
+                activateCommand = final.writeShellScript "deploy-rs-nixos-activate" ''
+                  exec ${final.systemd}/bin/systemd-run --quiet --wait --collect \
+                    --unit="deploy-rs-$RANDOM-$RANDOM-$$" \
+                    --description="deploy-rs activation/rollback" \
+                    --setenv=HOME="''${HOME:-/root}" \
+                    --setenv=PATH=${final.lib.makeBinPath [ final.nix final.coreutils final.gnused ]}:/run/current-system/sw/bin \
+                    ${final.deploy-rs.deploy-rs}/bin/activate "$@"
+                '';
                 dryActivate = "$PROFILE/bin/switch-to-configuration dry-activate";
                 boot = "$PROFILE/bin/switch-to-configuration boot";
                 test = "$PROFILE/bin/switch-to-configuration test";

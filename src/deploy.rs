@@ -354,8 +354,6 @@ pub async fn confirm_profile(
         }
     };
 
-    info!("Deployment confirmed.");
-
     Ok(())
 }
 
@@ -365,8 +363,6 @@ pub enum SSHActivateError {
     OtherError(std::io::Error),
     #[error("Failed to pipe to child stdin: {0}")]
     PipeError(std::io::Error),
-    #[error("Activating over SSH resulted in a bad exit code: {0:?}")]
-    Timeout(tokio::sync::oneshot::error::RecvError),
 }
 
 impl command::HasCommandError for SSHActivateError {
@@ -642,34 +638,24 @@ pub async fn deploy_profile(
             ssh_wait_command.arg(ssh_opt);
         }
 
-        let (send_activate, recv_activate) = tokio::sync::oneshot::channel();
-        let (send_activated, recv_activated) = tokio::sync::oneshot::channel();
-
-        let thread = tokio::spawn(async move {
+        let mut activation = tokio::spawn(async move {
             let ssh_activate_result =
                 read_remote_process_child(ssh_activate_child, demarcate_output).await;
 
-            let maybe_err = match ssh_activate_result {
-                Err(err) => Some(DeployProfileError::SSHActivate(
+            match ssh_activate_result {
+                Err(err) => Err(DeployProfileError::SSHActivate(
                     command::CommandError::RunError(err),
                 )),
                 Ok(ref exit_status) => match exit_status.code() {
-                    Some(0) => None,
-                    _exit_code => Some(DeployProfileError::SSHActivate(
+                    Some(0) => Ok(()),
+                    _exit_code => Err(DeployProfileError::SSHActivate(
                         command::CommandError::ExitStatus(
                             *exit_status,
                             format!("{:?}", ssh_activate_command),
                         ),
                     )),
                 },
-            };
-
-            if let Some(err) = maybe_err {
-                // The receiver is gone if the main task already returned; that is fine.
-                let _ = send_activate.send(err);
             }
-
-            let _ = send_activated.send(());
         });
 
         let mut ssh_wait_child = ssh_wait_command
@@ -703,32 +689,23 @@ pub async fn deploy_profile(
                     )),
                 };
             },
-            x = recv_activate => {
-                match x {
-                    Ok(err) => {
-                        debug!("Activate command exited with an error");
-                        return Err(err);
-                    }
-                    // The sender was dropped without sending an error, which means
-                    // activation finished successfully before the wait command returned.
-                    Err(_) => debug!("Activation finished before the wait command returned"),
-                }
+            x = &mut activation => {
+                x.map_err(|err| DeployProfileError::SSHActivate(command::CommandError::RunError(err.into())))??;
+                return Err(DeployProfileError::SSHActivate(command::CommandError::RunError(
+                    std::io::Error::other("activation ended before confirmation was requested")
+                )));
             },
         }
 
         info!("Success activating, attempting to confirm activation");
 
-        let c = confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr, closure).await;
-        recv_activated.await.map_err(|x| {
-            DeployProfileError::SSHActivate(command::CommandError::OtherError(
-                SSHActivateError::Timeout(x),
-            ))
-        })?;
-        c?;
-
-        thread.await.map_err(|x| {
+        let confirmation =
+            confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr, closure).await;
+        activation.await.map_err(|x| {
             DeployProfileError::SSHActivate(command::CommandError::RunError(x.into()))
-        })?;
+        })??;
+        confirmation?;
+        info!("Deployment confirmed.");
     }
 
     Ok(())

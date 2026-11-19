@@ -60,6 +60,7 @@ let
 
     flakeInputs = ''
       deploy-rs.url = "${../..}";
+      deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
       deploy-rs.inputs.utils.follows = "utils";
       deploy-rs.inputs.flake-compat.follows = "flake-compat";
 
@@ -92,7 +93,7 @@ let
       ).defaultNix
     '';
 
-  in pkgs.nixosTest {
+  in (pkgs.testers.nixosTest or pkgs.nixosTest) {
     inherit nodes name;
 
     testScript = { nodes }: let
@@ -252,6 +253,26 @@ in {
       assert "PREFIX_TEST_STDERR_MARKER" in deploy_output, deploy_output
       assert "Deployment confirmed." in deploy_output, deploy_output
       assert "📠" not in deploy_output, deploy_output
+    '';
+  };
+  # A successful confirmation SSH command is not proof that the activation
+  # worker accepted it. Do not report success if that worker later rolls back.
+  confirmation-worker-failure = mkTest {
+    name = "confirmation-worker-failure";
+    user = "deploy";
+    deploySteps = let
+      ignoreConfirmation = pkgs.writeShellScript "ssh-ignore-confirmation" ''
+        case "''${!#}" in
+          'rm '*) exit 0 ;;
+        esac
+        exec ${pkgs.openssh}/bin/ssh "$@"
+      '';
+    in ''
+      client.succeed("mkdir -p /tmp/ssh-test && ln -s ${ignoreConfirmation} /tmp/ssh-test/ssh")
+      out = client.fail("PATH=/tmp/ssh-test:$PATH deploy -s .#prefix-demarcation --confirm-timeout 2 -- --offline 2>&1")
+      assert "PREFIX_TEST_STDOUT_MARKER" in out, out
+      assert "SSH activation command" in out, out
+      assert "Deployment confirmed." not in out, out
     '';
   };
 }
